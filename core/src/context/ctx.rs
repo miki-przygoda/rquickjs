@@ -517,11 +517,46 @@ impl<'js> Ctx<'js> {
     pub fn as_raw(&self) -> NonNull<qjs::JSContext> {
         self.ctx
     }
+
+    /// Turns off compiling JavaScript source text in this context.
+    ///
+    /// After this call, `eval` (direct and indirect), `Function` and the `AsyncFunction`,
+    /// `GeneratorFunction` and `AsyncGeneratorFunction` constructors throw a `TypeError`, and
+    /// so does everything on this context that compiles source from Rust: [`Ctx::eval`] and
+    /// its variants, [`Module::declare`](crate::Module::declare) and
+    /// [`Module::evaluate`](crate::Module::evaluate). A module loader that compiles modules
+    /// from source fails the same way, so a static or dynamic `import` of a module that wasn't
+    /// declared before the call fails.
+    ///
+    /// Functions and modules compiled before the call still run. Declare a module (and the
+    /// modules it imports), or evaluate a script that returns a function, then call this, then
+    /// evaluate the module or call the function: the code runs, but it can never turn a string
+    /// into code.
+    ///
+    /// Only this context is affected; other contexts in the same runtime still compile. It
+    /// can't be undone.
+    ///
+    /// # Usage
+    /// ```
+    /// # use rquickjs::{Context, Function, Runtime};
+    /// # let rt = Runtime::new().unwrap();
+    /// # let ctx = Context::full(&rt).unwrap();
+    /// # ctx.with(|ctx| {
+    /// let program: Function = ctx.eval("() => 6 * 7").unwrap();
+    /// ctx.disable_eval();
+    /// assert_eq!(program.call::<_, i32>(()).unwrap(), 42);
+    /// assert!(ctx.eval::<i32, _>("6 * 7").is_err());
+    /// # });
+    /// ```
+    pub fn disable_eval(&self) {
+        unsafe { qjs::JS_DisableEval(self.ctx.as_ptr()) }
+    }
 }
 
 #[cfg(test)]
 mod test {
-    use crate::{CatchResultExt, JsLifetime};
+    use crate::{qjs, CatchResultExt, JsLifetime};
+    use std::string::String as StdString;
 
     #[test]
     fn exports() {
@@ -761,5 +796,256 @@ mod test {
         ctx.with(|ctx| {
             ctx.remove_userdata::<MyUserData>().unwrap().unwrap();
         })
+    }
+
+    /// Asserts that `res` failed with the `TypeError` QuickJS throws when compiling source text
+    /// is turned off.
+    fn assert_eval_not_supported<T: core::fmt::Debug>(
+        ctx: &crate::Ctx<'_>,
+        what: &str,
+        res: crate::Result<T>,
+    ) {
+        use crate::CaughtError;
+
+        match res.catch(ctx) {
+            Err(CaughtError::Exception(e)) => {
+                let name: StdString = e.as_object().get("name").unwrap();
+                assert_eq!(name, "TypeError", "{what}: {e}");
+                assert_eq!(
+                    e.message().as_deref(),
+                    Some("eval is not supported"),
+                    "{what}"
+                );
+            }
+            other => panic!("{what}: expected TypeError, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn disable_eval_runs_code_compiled_before() {
+        use crate::{Context, Function, Module, Runtime, Value};
+
+        let runtime = Runtime::new().unwrap();
+        let ctx = Context::full(&runtime).unwrap();
+        ctx.with(|ctx| {
+            // A script compiled but not run.
+            let src = c"globalThis.ranScript = true; 40 + 2";
+            let script = unsafe {
+                let val = qjs::JS_Eval(
+                    ctx.as_ptr(),
+                    src.as_ptr(),
+                    src.to_bytes().len() as _,
+                    c"script.js".as_ptr(),
+                    (qjs::JS_EVAL_TYPE_GLOBAL | qjs::JS_EVAL_FLAG_COMPILE_ONLY) as i32,
+                );
+                ctx.handle_exception(val).unwrap()
+            };
+            // A function returned by a script that has run.
+            let func: Function = ctx.eval("(a, b) => a * b").unwrap();
+            // An ES module and a module it imports, declared but not evaluated.
+            let dep = Module::declare(ctx.clone(), "dep", "export const base = 40;").unwrap();
+            let main = Module::declare(
+                ctx.clone(),
+                "main",
+                "import { base } from 'dep'; export const answer = base + 2;",
+            )
+            .unwrap();
+
+            ctx.disable_eval();
+
+            let ret = unsafe { ctx.handle_exception(qjs::JS_EvalFunction(ctx.as_ptr(), script)) }
+                .unwrap();
+            let ret = unsafe { Value::from_js_value(ctx.clone(), ret) };
+            assert_eq!(ret.as_int(), Some(42));
+            assert!(ctx.globals().get::<_, bool>("ranScript").unwrap());
+
+            assert_eq!(func.call::<_, i32>((6, 7)).catch(&ctx).unwrap(), 42);
+
+            let (dep, promise) = dep.eval().catch(&ctx).unwrap();
+            promise.finish::<()>().catch(&ctx).unwrap();
+            assert_eq!(dep.get::<_, i32>("base").unwrap(), 40);
+            let (main, promise) = main.eval().catch(&ctx).unwrap();
+            promise.finish::<()>().catch(&ctx).unwrap();
+            assert_eq!(main.get::<_, i32>("answer").unwrap(), 42);
+        })
+    }
+
+    #[test]
+    fn disable_eval_blocks_compiling_from_js() {
+        use crate::{Context, Function, Object, Runtime, Value};
+
+        let runtime = Runtime::new().unwrap();
+        let ctx = Context::full(&runtime).unwrap();
+        ctx.with(|ctx| {
+            let probes: Object = ctx
+                .eval(
+                    r#"({
+                        "direct eval": () => eval("1"),
+                        "direct eval with spread": () => eval(...["1"]),
+                        "indirect eval": () => (0, eval)("1"),
+                        "globalThis.eval": () => globalThis.eval("1"),
+                        "new Function": () => new Function("return 1"),
+                        "Function": () => Function("return 1"),
+                        "Function through a function's constructor": () =>
+                            (function () {}).constructor("return 1"),
+                        "AsyncFunction": () =>
+                            new (Object.getPrototypeOf(async function () {}).constructor)("return 1"),
+                        "GeneratorFunction": () =>
+                            new (Object.getPrototypeOf(function* () {}).constructor)("yield 1"),
+                        "AsyncGeneratorFunction": () =>
+                            new (Object.getPrototypeOf(async function* () {}).constructor)("yield 1"),
+                    })"#,
+                )
+                .unwrap();
+
+            // Every probe compiles source before the call.
+            for name in probes.keys::<StdString>() {
+                let name = name.unwrap();
+                let probe: Function = probes.get(name.as_str()).unwrap();
+                probe.call::<_, Value>(()).catch(&ctx).unwrap();
+            }
+
+            ctx.disable_eval();
+
+            let mut count = 0;
+            for name in probes.keys::<StdString>() {
+                let name = name.unwrap();
+                let probe: Function = probes.get(name.as_str()).unwrap();
+                assert_eval_not_supported(&ctx, &name, probe.call::<_, Value>(()));
+                count += 1;
+            }
+            assert_eq!(count, 10);
+        })
+    }
+
+    #[test]
+    fn disable_eval_blocks_compiling_from_rust() {
+        use crate::{context::EvalOptions, Context, Module, Runtime, Value};
+
+        let runtime = Runtime::new().unwrap();
+        let ctx = Context::full(&runtime).unwrap();
+        ctx.with(|ctx| {
+            ctx.disable_eval();
+
+            assert_eval_not_supported(&ctx, "Ctx::eval", ctx.eval::<Value, _>("1 + 1"));
+            assert_eval_not_supported(
+                &ctx,
+                "Ctx::eval_with_options as a module",
+                ctx.eval_with_options::<Value, _>(
+                    "export const a = 1;",
+                    EvalOptions {
+                        global: false,
+                        ..Default::default()
+                    },
+                ),
+            );
+            assert_eval_not_supported(&ctx, "Ctx::eval_promise", ctx.eval_promise("1 + 1"));
+            assert_eval_not_supported(
+                &ctx,
+                "Module::declare",
+                Module::declare(ctx.clone(), "m", "export const a = 1;"),
+            );
+            assert_eval_not_supported(
+                &ctx,
+                "Module::evaluate",
+                Module::evaluate(ctx.clone(), "n", "export const a = 1;"),
+            );
+        })
+    }
+
+    #[test]
+    fn disable_eval_dynamic_import_fails() {
+        use crate::{Context, Module, Promise, Runtime};
+
+        let runtime = Runtime::new().unwrap();
+        let ctx = Context::full(&runtime).unwrap();
+        ctx.with(|ctx| {
+            let main = Module::declare(
+                ctx.clone(),
+                "main",
+                "export const loaded = import('other');",
+            )
+            .unwrap();
+
+            ctx.disable_eval();
+
+            let (main, promise) = main.eval().catch(&ctx).unwrap();
+            promise.finish::<()>().catch(&ctx).unwrap();
+            let loaded: Promise = main.get("loaded").unwrap();
+            assert!(loaded.finish::<()>().catch(&ctx).is_err());
+
+            let res = Module::import(&ctx, "other").and_then(|p| p.finish::<()>());
+            assert!(res.catch(&ctx).is_err());
+        })
+    }
+
+    #[cfg(feature = "loader")]
+    #[test]
+    fn disable_eval_blocks_loading_modules_from_source() {
+        use crate::{
+            loader::{BuiltinLoader, BuiltinResolver},
+            Context, Module, Promise, Runtime,
+        };
+
+        // BuiltinLoader hands each module's source out once, so each runtime gets its own.
+        let runtime_with_loader = || {
+            let runtime = Runtime::new().unwrap();
+            runtime.set_loader(
+                BuiltinResolver::default().with_module("other"),
+                BuiltinLoader::default().with_module("other", "export const a = 1;"),
+            );
+            runtime
+        };
+
+        // The loader works on a context that can still compile.
+        let runtime = runtime_with_loader();
+        let ctx = Context::full(&runtime).unwrap();
+        ctx.with(|ctx| {
+            let ns = Module::import(&ctx, "other")
+                .and_then(|p| p.finish::<crate::Object>())
+                .catch(&ctx)
+                .unwrap();
+            assert_eq!(ns.get::<_, i32>("a").unwrap(), 1);
+        });
+
+        let runtime = runtime_with_loader();
+        let ctx = Context::full(&runtime).unwrap();
+        ctx.with(|ctx| {
+            let main = Module::declare(
+                ctx.clone(),
+                "main",
+                "export const loaded = import('other');",
+            )
+            .unwrap();
+
+            ctx.disable_eval();
+
+            let (main, promise) = main.eval().catch(&ctx).unwrap();
+            promise.finish::<()>().catch(&ctx).unwrap();
+            let loaded: Promise = main.get("loaded").unwrap();
+            assert_eval_not_supported(&ctx, "import()", loaded.finish::<()>());
+        });
+    }
+
+    #[test]
+    fn disable_eval_is_per_context() {
+        use crate::{Context, Runtime};
+
+        let runtime = Runtime::new().unwrap();
+        let locked = Context::full(&runtime).unwrap();
+        let open = Context::full(&runtime).unwrap();
+
+        locked.with(|ctx| ctx.disable_eval());
+
+        open.with(|ctx| {
+            let res: i32 = ctx
+                .eval("eval('1') + (0, eval)('1') + Function('return 1')()")
+                .catch(&ctx)
+                .unwrap();
+            assert_eq!(res, 3);
+        });
+        locked.with(|ctx| {
+            assert_eval_not_supported(&ctx, "Ctx::eval", ctx.eval::<i32, _>("1"));
+        });
     }
 }
